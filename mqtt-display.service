@@ -1,0 +1,15 @@
+[Unit]
+Description=MQTT MAX7219 Activity Display
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=m
+ExecStart=/usr/bin/python3 /home/m/mqtt_display.py
+Environment=PYTHONUNBUFFERED=1
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
