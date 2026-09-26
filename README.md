@@ -78,6 +78,29 @@ sudo systemctl enable --now mqtt-display
 journalctl -u mqtt-display -f
 ```
 
+## Node.js version
+
+`node/mqtt_display.js` is a port of the Python script with the same behaviour, settings and log format. Requires Node.js 18+.
+
+```bash
+sudo apt install nodejs npm build-essential   # build tools for the native spi-device module
+cd node
+npm install
+nano mqtt_display.js                          # CONFIGURATION block at the top
+
+node mqtt_display.js                          # MAX7219 via SPI
+node mqtt_display.js --console                # no hardware, ASCII output
+node mqtt_display.js --test                   # orientation test
+```
+
+systemd (use either the Python or the Node service, not both — they share the MQTT client id):
+
+```bash
+sudo cp node/mqtt-display-node.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now mqtt-display-node
+```
+
 ## Scales
 
 | `SCALE`    | How LEDs are counted |

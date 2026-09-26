@@ -1,0 +1,23 @@
+{
+  "name": "mqtt-log-indicator",
+  "version": "1.0.0",
+  "description": "MQTT broker activity indicator on a MAX7219 4x8x8 LED matrix (Raspberry Pi), Node.js version",
+  "main": "mqtt_display.js",
+  "bin": {
+    "mqtt-display": "mqtt_display.js"
+  },
+  "scripts": {
+    "start": "node mqtt_display.js",
+    "console": "node mqtt_display.js --console",
+    "test-orientation": "node mqtt_display.js --test"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "mqtt": "^5.10.0"
+  },
+  "optionalDependencies": {
+    "spi-device": "^3.1.2"
+  }
+}

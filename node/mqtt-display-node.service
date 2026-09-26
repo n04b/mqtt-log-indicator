@@ -1,0 +1,15 @@
+[Unit]
+Description=MQTT MAX7219 Activity Display (Node.js)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=m
+WorkingDirectory=/home/m/mqtt-log-indicator/node
+ExecStart=/usr/bin/node /home/m/mqtt-log-indicator/node/mqtt_display.js
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
