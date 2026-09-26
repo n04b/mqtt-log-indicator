@@ -43,11 +43,11 @@ sudo raspi-config                      # Interface Options → SPI → enable
 sudo apt install python3-spidev python3-paho-mqtt
 sudo usermod -aG spi $USER
 
-cp mqtt_display.py ~/
+cp python/mqtt_display.py ~/
 nano ~/mqtt_display.py                 # set MQTT_HOST / MQTT_USERNAME / MQTT_PASSWORD
 ```
 
-All settings are in the `CONFIGURATION` block at the top of `mqtt_display.py`.
+All settings are in the `CONFIGURATION` block at the top of `python/mqtt_display.py` (Python) and `node/mqtt_display.js` (Node.js).
 
 ## Run
 
@@ -69,10 +69,10 @@ MQTT | topic=zigbee2mqtt/0x84b4dbfffe247b3c | length=609 | LEDs=6
 
 ## systemd
 
-Edit `User=` and the path in `mqtt-display.service` if needed, then:
+Edit `User=` and the path in `python/mqtt-display.service` if needed, then:
 
 ```bash
-sudo cp mqtt-display.service /etc/systemd/system/
+sudo cp python/mqtt-display.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now mqtt-display
 journalctl -u mqtt-display -f
