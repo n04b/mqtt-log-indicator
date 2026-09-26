@@ -121,6 +121,24 @@ mosquitto_pub -t /mqtt-log-indicator/blink -m false   # stop
 
 The display flashes at maximum brightness, then returns to the previous picture and brightness. The command does not add a row; retained blink commands are ignored.
 
+### REST API
+
+The same command over HTTP (both versions, built-in server, no extra dependencies). Default port `8080`, set `HTTP_ENABLED`, `HTTP_HOST`, `HTTP_PORT`, `HTTP_TOKEN` in the config.
+
+```bash
+curl http://raspberrypi:8080/blink                   # 1 second
+curl http://raspberrypi:8080/blink?seconds=5         # 5 seconds (max 60)
+curl -X POST -d 5 http://raspberrypi:8080/blink      # body: 5 | true | false | {"seconds": 5}
+curl http://raspberrypi:8080/blink/stop              # stop
+curl http://raspberrypi:8080/status
+```
+
+```json
+{"ok": true, "blinking": true, "remaining": 3.42, "mqtt_connected": true, "auth_failed": false}
+```
+
+Bad values return `400`, unknown paths `404`. With `HTTP_TOKEN` set, send `Authorization: Bearer <token>` or `?token=<token>`, otherwise `401`. Without a token anyone on the network can trigger the blink; use `HTTP_HOST = "127.0.0.1"` to allow only local requests.
+
 ## Orientation
 
 Run `python3 mqtt_display.py --test`. The correct picture is one triangle over the whole height, pressed to the **left** edge: 1 LED wide at the top, +1 LED every 4 rows, 8 LEDs at the bottom. Copy the settings printed for the correct variant into the config.

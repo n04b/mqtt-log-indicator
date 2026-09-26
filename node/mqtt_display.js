@@ -48,6 +48,19 @@ const BLINK_MAX_SECONDS = 60;
 const BLINK_HZ = 10;          // flashes per second
 const BLINK_MODE = 'full';    // "full" = all LEDs, "content" = current picture
 
+// REST API for the same blink command (plain HTTP, no extra dependencies).
+//   GET|POST /blink                -> blink for BLINK_DEFAULT_SECONDS seconds
+//   GET|POST /blink?seconds=5      -> blink for 5 seconds (max BLINK_MAX_SECONDS)
+//   POST     /blink  body: 5 | true | false | {"seconds": 5}
+//   GET|POST /blink/stop           -> stop blinking
+//   GET      /status               -> JSON state (blinking, remaining, mqtt)
+// If HTTP_TOKEN is set, requests must send "Authorization: Bearer <token>"
+// or ?token=<token>; otherwise anyone on the network can make it blink.
+const HTTP_ENABLED = true;
+const HTTP_HOST = '0.0.0.0';  // "127.0.0.1" = only from the Pi itself
+const HTTP_PORT = 8080;
+const HTTP_TOKEN = '';
+
 // DISPLAY
 const WIDTH = 8;
 const HEIGHT = 32;
@@ -494,9 +507,11 @@ function blinkTick() {
 const AUTH_FAIL_CODES = [4, 5, 134, 135];
 let authFailPhase = 0;
 let authFailed = false;
+let mqttConnected = false;
 let retainedSkipped = 0;
 
 function onConnect(client) {
+  mqttConnected = true;
   log(`MQTT | connected to ${MQTT_HOST}:${MQTT_PORT}, subscribing to ${MQTT_TOPIC}`);
   client.subscribe(MQTT_TOPIC);  // re-subscribe after every reconnect
   if (authFailed) {
@@ -589,6 +604,7 @@ function makeClient() {
   });
 
   client.on('close', () => {
+    mqttConnected = false;
     // exponential backoff between reconnect attempts
     client.options.reconnectPeriod = Math.min(
       client.options.reconnectPeriod * 2, MQTT_RECONNECT_MAX_DELAY * 1000);
@@ -597,6 +613,119 @@ function makeClient() {
   client.on('offline', () => log('MQTT | disconnected, will reconnect'));
   client.on('message', onMessage);
   return client;
+}
+
+// ------------------------------------------------------------
+// REST API (blink)
+// ------------------------------------------------------------
+
+function blinkRemaining() {
+  return blinkTimer ? Math.max(0, (blinkUntil - Date.now()) / 1000) : 0;
+}
+
+/** Request body -> seconds (0 = stop), null if not understood, '' if empty. */
+function bodyToBlinkSeconds(raw) {
+  const text = raw.toString('utf8').trim();
+  if (!text) return '';
+  let value;
+  try {
+    value = JSON.parse(text);
+  } catch (e) {
+    return parseBlinkPayload(text);  // plain text: 5 / true / false
+  }
+  if (value !== null && typeof value === 'object' && !Array.isArray(value)) {
+    value = 'seconds' in value ? value.seconds : value.blink;
+  }
+  if (typeof value === 'boolean') value = value ? 'true' : 'false';
+  if (value === null || value === undefined || typeof value === 'object') return null;
+  return parseBlinkPayload(String(value));
+}
+
+function startHttpServer() {
+  const http = require('http');
+  const crypto = require('crypto');
+
+  const reply = (res, code, obj) => {
+    const data = Buffer.from(JSON.stringify(obj) + '\n');
+    res.writeHead(code, { 'Content-Type': 'application/json', 'Content-Length': data.length });
+    res.end(data);
+  };
+
+  const authorized = (req, url) => {
+    if (!HTTP_TOKEN) return true;
+    const header = req.headers.authorization || '';
+    const token = header.startsWith('Bearer ') ? header.slice(7) : (url.searchParams.get('token') || '');
+    const a = Buffer.from(token);
+    const b = Buffer.from(HTTP_TOKEN);
+    return a.length === b.length && crypto.timingSafeEqual(a, b);
+  };
+
+  const handle = (req, res, body) => {
+    const url = new URL(req.url, 'http://localhost');
+    const path = url.pathname.replace(/\/+$/, '') || '/';
+    const method = req.method;
+    if (!authorized(req, url)) return reply(res, 401, { ok: false, error: 'unauthorized' });
+
+    if (path === '/status' && method === 'GET') {
+      return reply(res, 200, {
+        ok: true,
+        blinking: blinkTimer !== null,
+        remaining: Math.round(blinkRemaining() * 100) / 100,
+        mqtt_connected: mqttConnected,
+        auth_failed: authFailed,
+      });
+    }
+
+    let seconds;
+    if (path === '/blink/stop' && (method === 'GET' || method === 'POST')) {
+      seconds = 0;
+    } else if (path === '/blink' && (method === 'GET' || method === 'POST')) {
+      seconds = '';
+      if (method === 'POST') seconds = bodyToBlinkSeconds(body);
+      const q = url.searchParams.get('seconds') ?? url.searchParams.get('s');
+      if (seconds === '' && q !== null) seconds = parseBlinkPayload(q);
+      if (seconds === '') seconds = BLINK_DEFAULT_SECONDS;
+      if (seconds === null) {
+        return reply(res, 400, {
+          ok: false,
+          error: `expected true/false or a number of seconds (0..${BLINK_MAX_SECONDS})`,
+        });
+      }
+    } else {
+      return reply(res, 404, {
+        ok: false, error: 'not found', endpoints: ['/blink', '/blink/stop', '/status'],
+      });
+    }
+
+    const ip = (req.socket.remoteAddress || '?').replace(/^::ffff:/, '');
+    log(`HTTP | ${ip} | blink ${seconds === 0 ? 'stop' : `${seconds} s`}`);
+    startBlink(seconds);
+    return reply(res, 200, { ok: true, seconds });
+  };
+
+  const server = http.createServer((req, res) => {
+    const chunks = [];
+    let size = 0;
+    req.on('data', (c) => {
+      size += c.length;
+      if (size <= 4096) chunks.push(c);
+    });
+    req.on('end', () => {
+      try {
+        handle(req, res, Buffer.concat(chunks));
+      } catch (e) {
+        log(`HTTP | error: ${e.message}`);
+        if (!res.headersSent) reply(res, 500, { ok: false, error: 'internal error' });
+      }
+    });
+  });
+  server.on('error', (e) => {
+    log(`HTTP | cannot listen on ${HTTP_HOST}:${HTTP_PORT}: ${e.message} (REST API disabled)`);
+  });
+  server.listen(HTTP_PORT, HTTP_HOST, () => {
+    log(`HTTP | listening on ${HTTP_HOST}:${HTTP_PORT}${HTTP_TOKEN ? ' (token required)' : ''}`);
+  });
+  return server;
 }
 
 // ------------------------------------------------------------
@@ -656,6 +785,7 @@ function main() {
 
   updateDisplay();
   log(scaleDescription());
+  if (HTTP_ENABLED) startHttpServer();
   client = makeClient();
 }
 

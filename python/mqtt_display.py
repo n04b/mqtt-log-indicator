@@ -46,6 +46,19 @@ BLINK_MAX_SECONDS = 60
 BLINK_HZ = 10          # flashes per second
 BLINK_MODE = "full"    # "full" = all LEDs, "content" = current picture
 
+# REST API for the same blink command (plain HTTP, no extra dependencies).
+#   GET|POST /blink                -> blink for BLINK_DEFAULT_SECONDS seconds
+#   GET|POST /blink?seconds=5      -> blink for 5 seconds (max BLINK_MAX_SECONDS)
+#   POST     /blink  body: 5 | true | false | {"seconds": 5}
+#   GET|POST /blink/stop           -> stop blinking
+#   GET      /status               -> JSON state (blinking, remaining, mqtt)
+# If HTTP_TOKEN is set, requests must send "Authorization: Bearer <token>"
+# or ?token=<token>; otherwise anyone on the network can make it blink.
+HTTP_ENABLED = True
+HTTP_HOST = "0.0.0.0"  # "127.0.0.1" = only from the Pi itself
+HTTP_PORT = 8080
+HTTP_TOKEN = ""
+
 # DISPLAY
 WIDTH = 8
 HEIGHT = 32
@@ -128,11 +141,15 @@ MSB_IS_LEFT = True
 
 import bisect
 import collections
+import hmac
+import json
 import math
 import signal
 import sys
 import threading
 import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, urlsplit
 
 import paho.mqtt.client as mqtt
 
@@ -492,12 +509,14 @@ def _blink_worker():
 AUTH_FAIL_CODES = (4, 5, 134, 135)
 auth_fail_phase = 0
 auth_failed = False
+mqtt_connected = False
 
 
 def on_connect(client, userdata, flags, rc, *args):
-    global auth_fail_phase, auth_failed
+    global auth_fail_phase, auth_failed, mqtt_connected
     rc_val = getattr(rc, "value", rc)
     if rc_val == 0:
+        mqtt_connected = True
         log("MQTT | connected to %s:%s, subscribing to %s" % (MQTT_HOST, MQTT_PORT, MQTT_TOPIC))
         client.subscribe(MQTT_TOPIC)  # re-subscribe after every reconnect
         if auth_failed:
@@ -513,6 +532,8 @@ def on_connect(client, userdata, flags, rc, *args):
 
 
 def on_disconnect(client, userdata, *args):
+    global mqtt_connected
+    mqtt_connected = False
     log("MQTT | disconnected (%s), will reconnect" % (args[-1] if args else "?"))
 
 
@@ -573,6 +594,117 @@ def make_client():
 
 
 # ------------------------------------------------------------
+# REST API (blink)
+# ------------------------------------------------------------
+
+def blink_remaining():
+    with blink_lock:
+        if blink_thread is None:
+            return 0.0
+        return max(0.0, blink_until - time.monotonic())
+
+
+def body_to_blink_seconds(raw):
+    """Request body -> seconds (0 = stop), None if not understood, "" if empty."""
+    text = raw.decode("utf-8", errors="replace").strip()
+    if not text:
+        return ""
+    try:
+        value = json.loads(text)
+    except ValueError:
+        return parse_blink_payload(text)  # plain text: 5 / true / false
+    if isinstance(value, dict):
+        value = value.get("seconds", value.get("blink"))
+    if isinstance(value, bool):
+        value = "true" if value else "false"
+    if value is None:
+        return None
+    return parse_blink_payload(str(value))
+
+
+class BlinkHandler(BaseHTTPRequestHandler):
+    server_version = "mqtt-log-indicator"
+
+    def log_message(self, fmt, *args):  # silence default access log
+        pass
+
+    def _reply(self, code, obj):
+        data = (json.dumps(obj) + "\n").encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _authorized(self, query):
+        if not HTTP_TOKEN:
+            return True
+        header = self.headers.get("Authorization", "")
+        token = header[7:] if header.startswith("Bearer ") else query.get("token", [""])[0]
+        return hmac.compare_digest(token.encode(), HTTP_TOKEN.encode())
+
+    def _handle(self, method):
+        url = urlsplit(self.path)
+        path = url.path.rstrip("/") or "/"
+        query = parse_qs(url.query)
+        if not self._authorized(query):
+            return self._reply(401, {"ok": False, "error": "unauthorized"})
+
+        if path == "/status" and method == "GET":
+            return self._reply(200, {
+                "ok": True,
+                "blinking": blink_active(),
+                "remaining": round(blink_remaining(), 2),
+                "mqtt_connected": mqtt_connected,
+                "auth_failed": auth_failed,
+            })
+
+        if path == "/blink/stop":
+            seconds = 0.0
+        elif path == "/blink":
+            seconds = ""
+            if method == "POST":
+                length = int(self.headers.get("Content-Length") or 0)
+                seconds = body_to_blink_seconds(self.rfile.read(min(length, 4096)))
+            if seconds == "" and ("seconds" in query or "s" in query):
+                seconds = parse_blink_payload((query.get("seconds") or query.get("s"))[0])
+            if seconds == "":
+                seconds = float(BLINK_DEFAULT_SECONDS)
+            if seconds is None:
+                return self._reply(400, {
+                    "ok": False,
+                    "error": "expected true/false or a number of seconds (0..%d)" % BLINK_MAX_SECONDS,
+                })
+        else:
+            return self._reply(404, {"ok": False, "error": "not found",
+                                     "endpoints": ["/blink", "/blink/stop", "/status"]})
+
+        log("HTTP | %s | blink %s" % (self.client_address[0],
+                                      "stop" if seconds == 0 else "%g s" % seconds))
+        start_blink(seconds)
+        return self._reply(200, {"ok": True, "seconds": seconds})
+
+    def do_GET(self):
+        self._handle("GET")
+
+    def do_POST(self):
+        self._handle("POST")
+
+
+def start_http_server():
+    try:
+        server = ThreadingHTTPServer((HTTP_HOST, HTTP_PORT), BlinkHandler)
+    except OSError as e:
+        log("HTTP | cannot listen on %s:%s: %s (REST API disabled)" % (HTTP_HOST, HTTP_PORT, e))
+        return None
+    server.daemon_threads = True
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    log("HTTP | listening on %s:%s%s" % (HTTP_HOST, HTTP_PORT,
+                                         " (token required)" if HTTP_TOKEN else ""))
+    return server
+
+
+# ------------------------------------------------------------
 # Main
 # ------------------------------------------------------------
 
@@ -627,6 +759,8 @@ def main():
     signal.signal(signal.SIGINT, shutdown)
 
     log(scale_description())
+    if HTTP_ENABLED:
+        start_http_server()
     client.connect_async(MQTT_HOST, MQTT_PORT, MQTT_KEEPALIVE)
     while True:
         try:
